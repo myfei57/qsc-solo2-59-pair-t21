@@ -112,6 +112,9 @@ class AuditLog:
         report = summarize(entries)
         report["journal_count"] = self._journal.count()
         report["active_segment"] = self._journal.active_segment()
+        health = self._journal.health()
+        report["journal_corrupt"] = health["corrupt"]
+        report["partial_segments"] = len(health["partial_segments"])
         return report
 
     def report(self) -> dict:
@@ -135,10 +138,29 @@ class AuditLog:
             segments=len(self._journal.segments()),
         )
 
-    def replay_from_journal(self, limit: int = 100_000) -> list[dict]:
-        """从落盘流水回放记录，供跨重启恢复使用。"""
+    def journal_health(self) -> dict:
+        """返回流水恢复/损坏健康结论，供控制台展示。"""
 
-        return self._journal.read_all()[-limit:]
+        return self._journal.health()
+
+    def replay_from_journal(self, limit: int = 100_000) -> list[dict]:
+        """从落盘流水回放记录，供跨重启恢复使用。
+
+        走显式回放：残缺段有效前缀参与，损坏隔离段不参与；健康结论可通过
+        :meth:`journal_health` 单独取，回放本身不会因坏段抛异常。
+        """
+
+        return self._journal.replay()["records"][-limit:]
+
+    def replay_all(self) -> list[dict]:
+        """严格读取完整活段流水；存在损坏空档时给出明确的损坏结论。
+
+        与 :meth:`replay_from_journal` 的区别：后者用于启动恢复，容忍残缺段前缀
+        并跳过隔离段；本方法供"我就要一份完整流水"的调用方，宁可报错也不给
+        缺段数据。
+        """
+
+        return self._journal.read_all()
 
     def replay_segment(self, index: int) -> list[dict]:
         """按段号回放一段流水。"""

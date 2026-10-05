@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 from ..audit.timeline import build_timeline
-from ..errors import StoreError
+from ..errors import CorruptStorageError, StoreError
 from ..store.index import summarize_documents
 from .pages import PageLibrary
 from .router import Router
@@ -77,6 +77,8 @@ class Api:
         add("GET", "/api/store", self._store)
         add("GET", "/api/timeline", self._timeline)
         add("GET", "/api/journal", self._journal)
+        add("GET", "/api/storage-health", lambda params, body: self._platform.storage_health())
+        add("POST", "/api/recover-state", self._recover_state)
         add("GET", "/api/config", lambda params, body: self._platform.config_export())
         add("GET", "/api/pages", lambda params, body: {"pages": self._pages.index(), "routes": self.routes()})
         add("POST", "/api/start", lambda params, body: self._platform.start())
@@ -152,11 +154,19 @@ class Api:
 
     def _store(self, params: dict, body: dict) -> dict:
         store = self._platform.store
+        try:
+            state = store.read("platform_state")
+            state_state = "ok"
+        except CorruptStorageError as error:
+            state = None
+            state_state = f"quarantined: {error.quarantine_path}"
         return {
             "root": store.root,
             "documents": summarize_documents(store),
             "platform_state_path": store.path_of("platform_state"),
-            "platform_state": store.read("platform_state"),
+            "platform_state": state,
+            "platform_state_health": state_state,
+            "quarantine": store.quarantine_report(),
         }
 
     def _timeline(self, params: dict, body: dict) -> dict:
@@ -164,17 +174,31 @@ class Api:
         return {"timeline": build_timeline(records, station=params.get("station"))}
 
     def _journal(self, params: dict, body: dict) -> dict:
-        journal = self._platform.audit.journal
+        audit = self._platform.audit
+        journal = audit.journal
+        health = audit.journal_health()
         payload: dict = {
             "topic": journal.topic,
             "count": journal.count(),
             "active_segment": journal.active_segment(),
-            "segments": journal.segments(),
+            "segments": [item["path"] for item in health["segments"]],
+            "health": health,
         }
         segment = params.get("segment")
         if segment is not None:
-            payload["records"] = self._platform.audit.replay_segment(int(segment))
+            index = int(segment)
+            payload["records"] = self._platform.audit.replay_segment(index)
+        if "strict" in params:
+            # 严格完整流水：坏段时直接得到 409 与明确原因，而不是一份缺段数据。
+            payload["strict_records"] = self._platform.audit.replay_all()
+        partial = params.get("partial")
+        if partial is not None:
+            payload["partial_records"] = journal.read_partial(int(partial))
         return payload
+
+    def _recover_state(self, params: dict, body: dict) -> dict:
+        state = body.get("state", body)
+        return self._platform.recover_state(state if isinstance(state, dict) else {})
 
     def _cycle(self, params: dict, body: dict) -> dict:
         return self._platform.cycle(dt=_as_float(body, "dt", 5.0))

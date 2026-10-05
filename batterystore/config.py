@@ -350,6 +350,7 @@ class StationConfig:
     soc: SocLimits
     balance: BalanceLimits
     quota: QuotaLimits
+    journal_on_damage: str = "quarantine"
 
     @classmethod
     def from_mapping(cls, mapping: Mapping[str, Any]) -> "StationConfig":
@@ -360,6 +361,12 @@ class StationConfig:
             raise ConfigError("station.name 必须是非空字符串", component="config")
         if not isinstance(storage_root, str) or not storage_root:
             raise ConfigError("station.storage_root 必须是非空字符串", component="config")
+        journal_on_damage = meta.get("journal_on_damage", "quarantine")
+        if journal_on_damage not in ("quarantine", "rebuild"):
+            raise ConfigError(
+                "station.journal_on_damage 只允许 'quarantine'（隔离留证）或 'rebuild'（截到有效前缀重建）",
+                component="config",
+            )
         limits = _section(mapping, "limits")
         return cls(
             name=name,
@@ -373,6 +380,7 @@ class StationConfig:
             soc=SocLimits.from_mapping(_section(limits, "soc")),
             balance=BalanceLimits.from_mapping(_section(limits, "balance")),
             quota=QuotaLimits.from_mapping(_section(limits, "quota")),
+            journal_on_damage=journal_on_damage,
         )
 
 
@@ -410,7 +418,7 @@ def config_to_mapping(cfg: StationConfig) -> dict:
     """把配置还原成可打印的映射。"""
 
     return {
-        "station": {"name": cfg.name, "storage_root": cfg.storage_root},
+        "station": {"name": cfg.name, "storage_root": cfg.storage_root, "journal_on_damage": cfg.journal_on_damage},
         "limits": {
             "rack": {
                 "cell_count": cfg.rack.cell_count,

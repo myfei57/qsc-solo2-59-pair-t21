@@ -16,7 +16,7 @@ from .balance.balance import Balancer
 from .bms.bms import Bms
 from .clock import Clock, SystemClock
 from .config import StationConfig, config_to_mapping, default_config
-from .errors import StoreError
+from .errors import CorruptStorageError, StoreError
 from .eventbus import Event, EventBus
 from .fire.fire import FireLinkage
 from .grid.grid import GridTie
@@ -84,7 +84,10 @@ class Platform:
 
         store = JsonStore(self.config.storage_root)
         self.store = store
-        self.audit = AuditLog(self.clock, self.bus, JsonlJournal(store.root, "audit", segment_limit=512))
+        self._journal = JsonlJournal(
+            store.root, "audit", segment_limit=512, on_damage=self.config.journal_on_damage
+        )
+        self.audit = AuditLog(self.clock, self.bus, self._journal)
         self.namespaces = NamespaceRegistry(station)
         self.topology: Topology = build_default_topology()
         self.trend = TrendBuffer(period_s=5.0)
@@ -115,8 +118,48 @@ class Platform:
         self._running = False
         self._lock = threading.RLock()
         self._register_namespaces()
+        self._announce_storage_recovery()
         self._restore()
         self.bms.calibration.record(self.config.soc.initial_soc_pct, self.clock.now(), "startup")
+
+    def _announce_storage_recovery(self) -> None:
+        """把启动期流水恢复结论作为告警事件广播，残缺/隔离不再静默发生。"""
+
+        health = self._journal.health()
+        for partial in health["partial_segments"]:
+            self.bus.publish(
+                Event.of(
+                    "station",
+                    "audit",
+                    "journal_partial_segment",
+                    severity="warning",
+                    station=self.station,
+                    message=(
+                        f"流水段 {partial['index']} 掉电残缺已单独归档（{partial['reason']}），"
+                        f"有效前缀 {partial['records']} 条，原档 {partial['archived']}"
+                    ),
+                    segment=partial["index"],
+                    archived=partial["archived"],
+                )
+            )
+        for damaged in health["quarantined_segments"]:
+            rebuilt = damaged.get("rebuilt_path")
+            self.bus.publish(
+                Event.of(
+                    "station",
+                    "audit",
+                    "journal_segment_quarantined",
+                    severity="alarm",
+                    station=self.station,
+                    message=(
+                        f"流水段 {damaged['index']} 损坏已隔离（{damaged['reason']}），证据 {damaged['archived']}"
+                        + (f"；已按策略重建为 {rebuilt}" if rebuilt else "；等待人工处理，未自动重建")
+                    ),
+                    segment=damaged["index"],
+                    archived=damaged["archived"],
+                    rebuilt=bool(rebuilt),
+                )
+            )
 
     def _register_namespaces(self) -> None:
         """登记现场设备命名空间（控制台与审计共用同一套名字）。"""
@@ -138,12 +181,31 @@ class Platform:
             self.namespaces.register(rack.zone, rack_id, "fire-zone-member")
 
     def _restore(self) -> None:
-        """从落盘状态恢复平台计数，保证重启后计数连续。"""
+        """从落盘状态恢复平台计数，保证重启后计数连续。
 
-        tail = self.audit.replay_from_journal(limit=1)
-        if tail:
-            self._last_audit_ts = AuditRecord.from_dict(tail[-1]).ts
-        state = self.store.read("platform_state")
+        流水走显式回放（``replay`` 返回记录与健康结论）：残缺段的有效前缀参与
+        回放，隔离损坏段不参与但服务照常启动。状态文档损坏时已被存储层隔离，
+        这里抓住明确的损坏结论、以零值启动并告警，绝不让整机重启。
+        """
+
+        replay = self.audit.replay_from_journal(limit=1)
+        if replay:
+            self._last_audit_ts = AuditRecord.from_dict(replay[-1]).ts
+        try:
+            state = self.store.read("platform_state")
+        except CorruptStorageError as error:
+            state = None
+            self.bus.publish(
+                Event.of(
+                    "station",
+                    "store",
+                    "state_document_quarantined",
+                    severity="alarm",
+                    station=self.station,
+                    message=f"platform_state 损坏已隔离，本次以默认计数启动；证据 {error.quarantine_path}",
+                    archived=error.quarantine_path,
+                )
+            )
         if self.store.exists("platform_state") and isinstance(state, dict):
             self._operations = int(state.get("operations", 0))
             self._cycles = int(state.get("cycles", 0))
@@ -285,6 +347,41 @@ class Platform:
             self._drills = 0
             self.store.remove("platform_state")
             return previous
+
+    def storage_health(self) -> dict:
+        """返回流水健康、文档结论与隔离区证据，供巡检/控制台给出明确结论。"""
+
+        return {
+            "journal": self._journal.health(),
+            "platform_state": self.store.inspect("platform_state"),
+            "quarantine": self.store.quarantine_report(),
+        }
+
+    def recover_state(self, payload: dict) -> dict:
+        """显式重建损坏的 platform_state。
+
+        只允许调用方拿着已校验的最后一次有效内容走到这里；存储层会再次拒绝
+        在活文件仍然健康时重建。重建前后证据都留在隔离区。
+        """
+
+        with self._lock:
+            if not isinstance(payload, dict):
+                raise StoreError("重建内容必须是映射", component="station")
+            path = self.store.recover_document("platform_state", payload)
+            self._operations = int(payload.get("operations", 0))
+            self._cycles = int(payload.get("cycles", 0))
+            self._drills = int(payload.get("drills", 0))
+            self.bus.publish(
+                Event.of(
+                    "station",
+                    "store",
+                    "state_document_rebuilt",
+                    severity="warning",
+                    station=self.station,
+                    message=f"platform_state 已按显式提供的有效内容重建：{path}",
+                )
+            )
+            return {"path": path, "recovered_from": "quarantined"}
 
     def transfer_grid_tie(self, power_kw: float = 120.0, frequency_hz: float = 50.0, dt: float = 1.0) -> dict:
         """并网编排：BMS 就绪 → PCS 切换 → 并网校验 → 功率输出。"""

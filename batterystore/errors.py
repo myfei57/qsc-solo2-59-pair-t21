@@ -40,7 +40,26 @@ class QuotaError(StoreError):
 
 
 class StorageError(StoreError):
-    """持久化读写失败。"""
+    """持久化读写失败（IO 失败等）。"""
+
+
+class CorruptStorageError(StorageError):
+    """盘上内容校验失败：半截文档或坏帧。
+
+    与普通 IO 失败区分开：这是一个"有明确结论"的错误——文件已经被隔离成
+    证据，服务可以带着默认值继续跑，而不是重启整机。``quarantine_path`` 指向
+    归档后的坏原件（文档直接隔离时可用；流水段汇总时可能为空）。
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        component: str = "store",
+        quarantine_path: str | None = None,
+    ) -> None:
+        super().__init__(message, component=component)
+        self.quarantine_path = quarantine_path
 
 
 class ConfigError(StoreError):
