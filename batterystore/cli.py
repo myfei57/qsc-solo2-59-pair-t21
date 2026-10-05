@@ -1,6 +1,6 @@
 """命令行入口。
 
-六个子命令覆盖日常使用：
+子命令覆盖日常使用与掉电巡检：
 
 ``serve``    启动控制台 HTTP 服务，可选地在启动后探测接口；
 ``demo``     在本地跑一遍完整流程（启动 → 并网切换 → 温度降额 → 均衡 → 充电 →
@@ -8,6 +8,9 @@
 ``status``   打印当前状态快照；
 ``config``   打印生效配置；
 ``alerts``   打印按最新编号路由后的告警；
+``quarantine`` 列出隔离区坏文档与残缺流水段（巡检用），可用
+             ``--rebuild-state`` 在人工确认后按当前计数重建平台状态文档——
+             只重建这份**可从流水复核的派生状态**，流水原件永不重建；
 ``reset``    清掉落盘的平台计数。
 """
 
@@ -171,6 +174,24 @@ def _cmd_reset(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_quarantine(args: argparse.Namespace) -> int:
+    """巡检隔离区；可选地按内存计数重建被隔离的平台状态文档。"""
+
+    platform = _build(args)
+    payload: dict = {
+        "documents": platform.store.quarantined(),
+        "partial_segments": platform.audit.journal.partial_segments(),
+    }
+
+    if args.rebuild_state:
+        # 前提复核：文档确已隔离（正式文件不在），来源是平台从流水复核出的当前
+        # 计数。rebuild 只写新文件，隔离原件原样保留；流水是唯一事实来源，
+        # 不参与重建。
+        payload["rebuilt"] = platform.rebuild_state_document()
+    _dump(payload)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """构造命令行解析器。"""
 
@@ -212,6 +233,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     reset = sub.add_parser("reset", help="清掉落盘的平台计数", parents=[common])
     reset.set_defaults(func=_cmd_reset)
+
+    quarantine = sub.add_parser(
+        "quarantine", help="列出隔离区坏文档与残缺流水段", parents=[common]
+    )
+    quarantine.add_argument(
+        "--rebuild-state",
+        action="store_true",
+        help="人工确认后按流水复核的当前计数重建 platform_state（原件保留隔离）",
+    )
+    quarantine.set_defaults(func=_cmd_quarantine)
     return parser
 
 

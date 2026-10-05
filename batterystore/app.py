@@ -17,6 +17,7 @@ from .bms.bms import Bms
 from .clock import Clock, SystemClock
 from .config import StationConfig, config_to_mapping, default_config
 from .errors import StoreError
+from .errors import DocumentCorruptError
 from .eventbus import Event, EventBus
 from .fire.fire import FireLinkage
 from .grid.grid import GridTie
@@ -138,13 +139,41 @@ class Platform:
             self.namespaces.register(rack.zone, rack_id, "fire-zone-member")
 
     def _restore(self) -> None:
-        """从落盘状态恢复平台计数，保证重启后计数连续。"""
+        """从落盘状态恢复平台计数，保证重启后计数连续。
+
+        掉电损坏不能把启动带崩：文档损坏时存储层已把坏文件隔离，这里记录告警后
+        按零值起步；残缺流水段在打开流水时已被单独登记，这里逐条留痕。两者都是
+        确定结论，不静默、不重建（重建要在人工确认来源后显式触发）。
+        """
+
+        for partial in self.audit.journal.partial_segments():
+            self.bus.publish(
+                Event.of(
+                    "audit",
+                    "audit",
+                    "segment_partial",
+                    station=self.station,
+                    severity="alarm",
+                    message=(
+                        f"流水段 {partial['segment']} 残缺（{partial.get('reason')}），"
+                        f"有效前缀 {partial.get('valid_count', 0)} 条，原件已隔离："
+                        f"{partial.get('quarantined_path', '')}"
+                    ),
+                    segment=partial["segment"],
+                    reason=partial.get("reason", ""),
+                    valid_count=partial.get("valid_count", 0),
+                )
+            )
 
         tail = self.audit.replay_from_journal(limit=1)
         if tail:
             self._last_audit_ts = AuditRecord.from_dict(tail[-1]).ts
-        state = self.store.read("platform_state")
-        if self.store.exists("platform_state") and isinstance(state, dict):
+        try:
+            state = self.store.read("platform_state")
+        except DocumentCorruptError as error:
+            self.note_error(error)
+            state = None
+        if isinstance(state, dict):
             self._operations = int(state.get("operations", 0))
             self._cycles = int(state.get("cycles", 0))
             self._drills = int(state.get("drills", 0))
@@ -161,6 +190,25 @@ class Platform:
                 "station": self.station,
             },
         )
+
+    def rebuild_state_document(self) -> str:
+        """按从流水复核出的当前计数重建平台状态文档。
+
+        这是唯一允许自动重建的文档：它是流水的派生状态，重建来源可由流水验证；
+        重建前坏文档必须已经被读取路径隔离（store.rebuild 会拒绝覆盖仍在的正式
+        文件）。流水原件本身永远不重建。
+        """
+
+        with self._lock:
+            return self.store.rebuild(
+                "platform_state",
+                {
+                    "operations": self._operations,
+                    "cycles": self._cycles,
+                    "drills": self._drills,
+                    "station": self.station,
+                },
+            )
 
     def _rack(self, rack_id: str | None) -> Rack:
         """按标识取簇，缺省取第一簇。"""

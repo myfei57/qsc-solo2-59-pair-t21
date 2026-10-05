@@ -43,6 +43,44 @@ class StorageError(StoreError):
     """持久化读写失败。"""
 
 
+class CorruptStorageError(StorageError):
+    """盘上内容校验不通过。
+
+    与普通 IO 失败分开：这是"盘上已经有坏数据"的确定结论，调用方应当走隔离／
+    重建分支，而不是当作一次可以重试的瞬态失败。坏文件位置与隔离去向随异常带出，
+    读取入口永远给调用方一个明确说法，而不是让解析栈把服务带崩。
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        component: str = "store",
+        path: str = "",
+        quarantine_path: str = "",
+        reason: str = "corrupt",
+    ) -> None:
+        super().__init__(message, component=component)
+        self.path = path
+        self.quarantine_path = quarantine_path
+        self.reason = reason
+
+    def as_record(self) -> dict:
+        record = super().as_record()
+        record["path"] = self.path
+        record["quarantine_path"] = self.quarantine_path
+        record["reason"] = self.reason
+        return record
+
+
+class DocumentCorruptError(CorruptStorageError):
+    """原子文档读取时发现内容损坏（半截、JSON 非法或校验不符）。"""
+
+
+class SegmentCorruptError(CorruptStorageError):
+    """流水段不是一份完整有效内容（残缺尾或校验不符）。"""
+
+
 class ConfigError(StoreError):
     """配置缺失或取值非法。"""
 

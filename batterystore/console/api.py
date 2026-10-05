@@ -155,8 +155,9 @@ class Api:
         return {
             "root": store.root,
             "documents": summarize_documents(store),
+            "quarantined": store.quarantined(),
             "platform_state_path": store.path_of("platform_state"),
-            "platform_state": store.read("platform_state"),
+            "platform_state": store.read_or_default("platform_state", None),
         }
 
     def _timeline(self, params: dict, body: dict) -> dict:
@@ -170,6 +171,8 @@ class Api:
             "count": journal.count(),
             "active_segment": journal.active_segment(),
             "segments": journal.segments(),
+            "segment_states": journal.segment_states(),
+            "partial_segments": journal.partial_segments(),
         }
         segment = params.get("segment")
         if segment is not None:
